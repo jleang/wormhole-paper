@@ -1,0 +1,332 @@
+\section{Introduction}
+Large-scale machine learning (ML) aims at statistical analysis and predictive modeling over large data collections~\cite{CohenDDHW09}, commonly using data-parallel frameworks like Spark~\cite{ZahariaCDDMMFSS12}. State-of-the-art ML systems allow data scientists to express their ML algorithms---ranging from classification, regression, and clustering to matrix factorization and deep learning---in linear algebra and statistical functions \cite{AbadiBCCDDDGIIK16,BoehmDEEMPRRSST16,HuangB013,LuoGGPJ17,RohrmannSRG17,MahoutSamsara,StonebrakerBPR11,YuSC15,YuTAMAO17}, and automatically compile efficient execution plans. This high-level specification simplifies the development of custom ML algorithms, and allows the adaptation of execution plans to different data, hardware, and deployment characteristics.
+
+
+\paragraph{Rewriting Opportunities in Linear Algebra} 
+As the lingua franca of ML algorithms, linear algebra admits numerous rewriting opportunities that improve their performance.  For example, the rewrites XXXX 
+
+The rewrites listed above are just a small selection of useful rewrites to include inside a query optimizer for ML algorithms.  An immediate question to address is whether we can write down \emph{every} linear algebra rewrite that improves ML algorithm performance. Many ML optimizers (e.g., X, Y, Z) aim to achieve exactly this, encoding long lists of rewrite rules that encode identities as well as the conditions and order in which to apply them.
+
+Unfortunately, exhaustively enumerating linear algebra identities that improve performance in rule-based optimizers is a significant challenge.  Newly written ML scripts admit new patterns of linear algebra operators, which often require adding rewrite rules and re-thinking the order in which they apply (often called the phase ordering problem \cite{X}).
+
+
+\paragraph{A ``Primitive'' Approach to LA Rewrites}
+The core of these rewrites lies not in matrix identities but instead in properties of the primitive scalar operators + and *.  These scalar operators are the basis of the most common linear algebra operators including matrix addition ($A + B$), matrix multiplication ($AB$), element-wise multiplication ($A * B$), and aggregation (sum($A$), rowSums($A$), colSums($A$)).
+
+In this work, we build on the hypothesis that reasoning at the scalar level inside an optimizer will match the performance of existing rule-based optimizers, by deriving their identities from first principles, as well as exceed their performance in some cases via the automatic derivation of new identities.
+
+
+\paragraph{An Example from Matrix Factorization}
+Consider the task of Gaussian matrix factorization.  
+This task factorizes a matrix $X$, often sparse, into the product of low-rank dense matrices $UV^\tr$. 
+Matrices $U$ and $V$ are iteratively updated until the difference between $X$ and its approximation is small enough in L2, $sum((X - UV^\tr)^2) < \epsilon$.  The ``power of 2'' operator here indicates element-wise power, i.e., raising each entry of the matrix to the power 2.
+
+The query $sum((X - UV^\tr)^2)$ is expensive even for moderately sized matrices. 
+The problem is that $UV^\tr$ creates a dense intermediary in the shape of $X$, even though $X$ is sparse, resulting in high memory and CPU pressure.
+The LA engines SystemML (0.14), XXX, and YYY all struggle to execute this query, not because the query is impossible to optimize but rather that their optimizers are missing a rule that targets this pattern.
+
+A rewrite of this query into a more efficient form can be recovered from first principles as follows:
+\begin{enumerate}
+  \item Decompose subtraction into addition:\\ $sum((X + (-1)*UV^\tr)^2)$.
+  \item Decompose element-wise power into element-wise multiplication: 
+  $sum((X + (-1)*UV^\tr) * (X + (-1)*UV^\tr))$.
+  \item Rewrite matrix operators as scalar operators over indexed matrices: 
+  $\sum_{ik} ((X_{ik} + \sum_j (-1)*U_{ij}V_{kj}) * (X_{ik} + \sum_l (-1)*U_{il}V_{kl}))$.
+  \item Distribute $*$ over $+$ and $\sum$ over $+$; factor $\sum$ from $*$: 
+  $\sum_{ik} X_{ik}*X_{ik} + \sum_{ikj} (-2)*X_{ik}*U_{ij}V_{kj} + \sum_{ikjl} U_{ij}V_{kj}*U_{il}V_{kl}$.
+  \item Reorder aggregated indices in the third term and factor:
+  $\sum_{ik} X_{ik}*X_{ik} + \sum_{ikj} (-2)*X_{ik}*U_{ij}V_{kj} + \sum_{jl} (\sum_i (U_{ij}U_{il}) * \sum_k (V_{kj}*V_{kl}))$.
+  \item Recover matrix operators, subtraction, power:\\
+  $sum(X^2) - 2*sum(X*UV^\tr) + sum(U^\tr U * V^\tr V)$.
+\end{enumerate}
+The final expression exploits the sparsity of $X$ in the first two terms\footnote{$X$ multiplies with $UV^\tr$ in the rewritten plan, allowing the computation to proceed only in the non-zero entries of $X$, whereas $X$ subtracts $UV^\tr$ in the original expression to form a dense matrix.}, and it converts the third term into the element-wise multiplication of inner products, which are far smaller than the outer product $UV^\tr$.\footnote{To relate these steps to our optimizer, steps 1--4 rewrite the query into a canonical form (see Section 2), from which the factorization in step 5 is found during search.}
+
+While any rule-based optimizer could encode a rule for this rewrite directly (in fact, SystemML added such a rule in version 0.15), we highlight how it automatically arises as a result of primitive rewrites at the scalar level. In general, however, generating rewrites from first principles is more risky than taking a rule-based optimization approach.  The challenge lies in the large search space generated by rewrites at the primitive level; there is no guarantee that a good rewrite can be found in a reasonable time frame.  
+
+% missing DAG challenges CSE
+
+\paragraph{Contributions}
+We introduce a cost-based framework for optimizing the sum-product portions of linear algebra scripts.  In particular, the framework optimizes expressions containing addition and common sub-expressions (CSEs), on top of multiplication and aggregation as covered by previous work.  The framework revolves around a canonical form defined on an indexed-matrix representation, from which it explores alternative rewrites within a carefully carved search space.  
+
+Section 2 -- related work
+
+Section 3 -- representation and canonical form
+
+Section 4 -- search strategy and pruning
+
+Section 5 -- experiments
+
+We prototype our framework in Apache SystemML, a large-scale LA execution engine.  However, we believe that our techniques apply more generally to other LA engines, such as Tensorflow and Julia, when given reasonable cost models over their operators.
+
+
+
+
+\section{Related Work}
+The closest sum-product optimization frameworks in the literature (FAQ \cite{KhamisNR16}, AJAR \cite{Joglekar2016AJARAA}, PANDA) cover LA expressions involving $*$ and $\sum$.
+These frameworks have an excellent coverage of theory and implementation,
+but they fall short of LA workloads that occur in practice.
+We step past these frameworks by (1) incorporating common sub-expressions and (2) incorporating addition ($+$).
+
+...
+
+
+\section{Modeling the Optimization Problem}
+
+Linear algebra means one data type (matrix) and a set of matrix operations:
+%\begin{align*}
+%M * M \rightarrow M & \text{elemmult} \\
+%M + M \rightarrow M & \text{elemplus} \\
+%MM \rightarrow M & \text{mmult} \\
+%\sum_{row} M \rightarrow M & \text{rowagg} \\
+%\sum_{col} M \rightarrow M & \text{colagg} \\
+%\sum M \rightarrow M & \text{agg} \\
+%% M^k \rightarrow & \text{power} \\
+% M^\tr & \text{transpose} \\
+% \end{align*}
+
+
+% \begin{table}[]
+% \begin{tabular}{lll}
+% name & type & syntax \\
+% \hline
+% mmult & $M_{N,L} \times M_{L,M} \rightarrow M_{N,M}$ & $AB$  \\
+% elemmult & $M_{N,M} \times M_{N,M} \rightarrow M$ & $A*B$ \\
+% elemplus & $M_{N,M} \times M_{N,M} \rightarrow M_{N,M}$ & $A+B$ \\
+% rowagg & $M_{N,M} \rightarrow M_{N,1}$ & $\sum_{row} A$ \\
+% colagg & $M_{N,M} \rightarrow M_{1,M}$  & $\sum_{col} A$ \\
+% agg & $M_{N,M} \rightarrow M_{1,1}$ & $\sum A$ \\
+% %power & $M  \times Int \rightarrow M$ & $A^k$ \\
+% transpose & $M_{N,M} \rightarrow M_{M,N}$ & $M^\tr$ \\
+% \end{tabular}
+% \end{table}
+
+This language subsumes most definitions of linear algebra.   Matrix multiply is modeled as elemmult followed by aggregation.   FAQ was just elemult and aggregation, not elemplus. 
+
+Example: AB + AC + AD + AE = A(B+C+D+E)   RHS is clearly faster (only one multiply) if A is dense.
+
+1) Nobody else does this kind of reasoning.  (caveats?)
+2) This kind of reasoning is hard, because the space blows up.  (evidence?  Can we analytically derive the blowup?)
+3) This kind of reasoning matters.  Besides Example 1, we find that this kind of reasoning can lead to plans that are X times faster than plans optimized without considering elemplus.  This matters, part 2: Does it show up in practice?  Yes: Consider any ML algorithm -- regularizers, errors, update rules all have combinations of sums and products.
+
+with existing heuristics
+
+Optimization problem is to find an equivalent expression with a lower estimated cost.
+
+[Some things to show somewhere that cost model reflects true costs]
+
+Figure: "Symbols used"
+
+%SumProduct Expression:
+%mmult, elemmult, elemplus, elemminus, elempower, $\Sigma$, transpose
+
+
+%A DimLabel with respect to a tensor or indexed tensor A is an injective function mapping the dimensions of A to a universe of labels. 
+%$Bind_{i,j}(A)$ assigns the label $i$ to the first dimension of A (its rows), and $j$ to the second dimension (its columns).
+
+
+\section{Plan Representation}
+In this section we define sum-product matrix expressions (the input and output of our optimizer), SPlans (the primitive decomposition our optimizer reasons with), a canonical form for SPlans (used to stage cost-based search), and the graph representation of SPlans (used to define the search procedure).
+
+
+\subsection{Sum-Product Matrix Expressions}
+The programs that SystemML compiles are specified in the DML, a syntax similar to R.  The scope of DML is much larger than the scope of this paper, due to the presence of advanced operators such as cbind (concatenate the columns of two matrices), table (construct a matrix from vectors of column indices, row indices, and values), element-wise Boolean functions, and control-flow operators (e.g. if statements, while loops).
+For the purpose of this paper, we narrow our optimizer to a single control-flow unit and to ignore advanced operators, treating them instead as black-box external functions.
+
+The fragment of DML paired-down to the operators we wish to optimize can be defined as sum-product matrix expressions:
+\begin{definition}[Sum-product matrix expression]
+In the following, let the term ``matrix'' refer also to vectors and scalars, but not higher-order tensors.
+A sum-product matrix expression is a collection of expressions (one for each output) in an algebra over matrices with the following operators:
+\begin{itemize}
+  \item Unary operators: element-wise power (parameterized with a constant, non-negative integer power), aggregation (parameterized with an aggregation type: row, column, or both), and transpose.
+  \item Binary operators: matrix multiply, element-wise multiply, addition, and subtraction.
+  \item N-ary operators: external functions treated as black boxes.
+\end{itemize}
+\end{definition}
+
+
+Take the example of computing the means and variances of the columns from the matrix multiplication $AB$ as an example.
+This can be written as the sum-product matrix expression $colSums(AB) / nrow(A),\; (colSums((AB)^2) - colSums(AB)^2) / nrow(A)$, where $nrow$ is an external function that returns the number of rows in a matrix (usually inlined) and $/$ is an external function that computes element-wise division.
+
+Figure XX presents this sum-product matrix expression in DAG form.
+It is conventient to write sum-product as DAGs because they emphasize the presence of common sub-sxpressions (CSEs), which are critical to recognize during optimization.  
+This particular DAG has two roots for the output row vectors.
+
+%The next section continues with this example, translating the sum-product matrix expression into an SPlan.
+% also present: dimension, shape, sparsity estimate
+
+
+
+\subsection{SPlans}
+While sum-product matrix expressions correctly capture the semantics of a ML algorithm, it is difficult to reason over them directly because they contain compound operators like matrix multiplication and element-wise power.  In this section we introduce SPlans as the decomposition of sum-product matrix expressions.  First we define the objects of SPlans, indexed tensors, and then define SPlans and include an example.
+
+\begin{definition}[Indexed Tensor]
+An indexed tensor is a tensor with a different index for each of its dimensions.
+The set of indices of an indexed tensor is called its \emph{schema}.
+The set inclusion $i \in A$ denotes that the index $i$ is present in the schema of a tensor $A$.
+Each index has an associated natural number shape, denoted $|i|$ for an index $i$. 
+An indexed tensor's shape is defined by the shape of the indices in its schema.
+\end{definition}
+For example the matrix $A$ may be assigned the index $i$ over its rows and $j$ over its columns, to be written as $A_{ij}$.
+While the order in which indices are assigned to dimensions is significant, the schema itself is unordered.
+
+\begin{definition}[SPlan]
+An SPlan is a collection of expressions (one for each output) in an algebra over tensors and indexed tensors with the following operators:
+\begin{itemize}
+  \item Unary operators: bind (assign indices to an tensor), unbind (unassign indices from an indexed tensor), aggregation (over an indexed tensor; parameterized with the indices to aggregate).
+  \item N-ary operators: multiply, addition (both over indexed tensors), external functions treated as black boxes (over tensors).
+  \begin{itemize}
+    \item The arguments of multiply and addition are unordered.
+  \end{itemize}
+\end{itemize}
+\end{definition}
+
+
+\begin{table}[]
+\begin{tabular}{llll}
+&name & type & syntax \\
+\hline
+\multirow{7}{*}{\rotatebox[origin=c]{90}{MPlan}} 
+&mmult & $T_{M,L} \times T_{L,N} \rightarrow T_{M,N}$ & $AB$  \\
+&elemmult & $T_{M,N} \times T_{M,N} \rightarrow T_{M,N}$ & $A*B$ \\
+&elemplus & $T_{M,N} \times T_{M,N} \rightarrow T_{M,N}$ & $A+B$ \\
+&rowagg & $T_{M,N} \rightarrow T_{M,1}$ & $\sum_{row} A$ \\
+&colagg & $T_{M,N} \rightarrow T_{1,N}$  & $\sum_{col} A$ \\
+&agg & $T_{M,N} \rightarrow T_{1,1}$ & $\sum A$ \\
+%&power & $M  \times Int \rightarrow M$ & $A^k$ \\
+&transpose & $T_{M,N} \rightarrow T_{N,M}$ & $A^\tr$ \\
+\hline
+\multirow{2}{*}{\rotatebox[origin=c]{90}{conv.}}
+&bind & $T_{M,N} \times [i,j] \rightarrow R_{i:M,j:N}$ & $\bind{i,j} A$ \\
+&unbind & $R_{i:M,j:N} \times [i,j] \rightarrow T_{M,N}$ & $\unbind{i,j} A$ \\
+\hline
+\multirow{2}{*}{\rotatebox[origin=c]{90}{SPlan}}
+&join & $R_{S_1} \times R_{S_2} \rightarrow R_{S_1 \cup S_2}$ & $A*B$ or $A+B$ \\
+&agg & $R_S \times U \rightarrow R_{S \setminus U}$ & $\sum_{U} A$ \\
+\end{tabular}
+\caption{Operators used in MPlans and SPlans. Uninterpreted black-box functions are also allowed.}
+\end{table}
+
+
+SPlans decompose and assign indices to the parts of a sum-product matrix expression that can be optimized by rewrites over addition, multiplication, and aggregation.  The parts that cannot be optimized does not use indices and remains outside the purview of the optimizer.
+
+Translating a sum-product matrix expression to an SPlan is a straightforward application of a few rules:
+\begin{enumerate}
+  \item $A - B \rightarrow A + (-1) * B$
+  \item For small non-negative integers $k$, $A^k \rightarrow A * A^{k-1}$.
+  \item $A*B \rightarrow Unbind_{i,j}(Bind_{i,j}(A)*Bind_{i,j}(B))$.  \\Same pattern for $+$.
+  \item $AB \rightarrow Unbind_{i,k} \sum_j (Bind_{i,j}(A)*Bind_{j,k}(B))$. 
+  \item $A^\tr \rightarrow Unbind_{j,i}(Bind_{i,j}(A))$.
+  \item $rowSums(A) \rightarrow Unbind_{i}(\sum_j Bind_{i,j}(A))$.  Similar pattern for $colSums$, $sum$.
+\end{enumerate}
+The resulting translation is correct, but crude since it surrounds every operator with binds and unbinds.  
+The number of bind and unbind operators can be reduced by applying a few simple renaming and elimination rules.
+For example, a bind-unbind sequence can be eliminated by renaming the unbound indices to the bound ones in the expression below it: $Bind_{x,y}(Unbind_{i,j}(e)) \rightarrow \rho[x/i, y/j](e)$.
+Similar rules handle other patterns.  
+
+Some elimination is impossible by design, as in $Unbind_{j,i}(Bind_{i,j}(e))$, due to the choice to encode transpose not as a first-class operator but rather as an artifact of index bind/unbinding that can be recovered at a later point. This design enables one to defer the choice of when to transpose, since transposes can often be ``moved around an expression'', as in $AB^\tr = (BA^\tr)^\tr$.
+
+Continuing the previous example, Figure YY presents the SPlan after translating the sum-product matrix expression from Figure XX.
+The form present in Figure YY also happens to be canonical, as discussed in the next section.
+
+
+
+\subsection{SPlan Canonical Form}
+We now introduce a canonical form for SPlans.
+The purpose of the form is to (1) identify common sub-expressions (i.e., expressions that may differ in their syntax but compute the same function) and (2) act as a neutral starting point from which we may systematically enumerate alternative plans.  Fulfilling these roles requires the canonical property, that two SPlans have the same canonical form if and only if they are semantically equivalent (i.e., they compute the same result on every input).\footnote{Our canonical form technically is only canonical up to uninterpreted constants. Constant folding, such as replacing $2 + 3$ with 5, occurs before and after our optimization process and affects the estimated cost of plans little.}
+
+Our form is similar in spirit to the disjunctive normal form (DNF) in propositional logic, also known as a truth table.  DNF formulae are rarely the most efficient form to execute, but they do act as a canonical form and also serve as a starting point for finding more efficient forms.  %((Reference K-V maps?))
+Our form is also similar to the canonical form of polynomials as a sum of monomials, except that the monomial terms also include aggregations and constants are treated as black-box symbols, rather than real numbers.
+
+The canonical form for SPlans is the sum-of-aggregations-of-products.  Additions are pulled above aggregations and multiplications, and aggregations are pulled above multiplications.  Specifically, the canonical form results from applying the following rules:
+\begin{enumerate}
+  \item $A * (B + C) \rightarrow A*B + A*C$
+  \item $\sum_i (A + B) \rightarrow \sum_i A + \sum_i B$
+  \item If $i \not\in A$, then $A * \sum_i B \rightarrow \sum_i (A * B) \quad$ (else rename indices)
+  \item $\sum_i \sum_j A \rightarrow \sum_{i,j} A$
+  \item $\sum_i A \rightarrow \sum_{i,j} A$
+  \item If $i \not\in A$, then $\sum_i A \rightarrow A * |i|$
+  \item $A + (B + C) \rightarrow +(A, B, C) \quad$ (binary to n-ary addition)
+  \item $A * (B * C) \rightarrow *(A, B, C) \quad$ (binary to n-ary multiply)
+\end{enumerate}
+
+Todo: analyze the above rules as a Term Rewriting System and prove that it has the canonical form property.
+
+
+\subsection{Graph Interpretation of SPlans}
+Interpret SPlans as bags of graphs.
+
+
+
+
+\section{Plan Enumeration and Selection}
+
+
+
+\subsection{Space of Plans}
+
+
+
+
+\subsection{Bottom-Up Enumeration}
+
+
+
+
+\subsection{Cost Model}
+
+
+
+
+\subsection{Pruning}
+
+
+
+
+\section{Experiments}
+
+\subsection{Accuracy of Cost Model}
+Does the cost model realistically track runtime?
+
+
+\subsection{Goodness of Plans}
+Does the optimizer find good plans? 
+
+
+
+\subsection{Scaling with Plan Complexity}
+Does the optimizer perform well on larger and larger queries?
+
+
+
+\subsection{Incremental Improvement of Plans}
+Does the optimizer continuously find better plans as it searches?
+
+
+
+
+
+
+
+
+% % Goal: find a normalization function $n$ such that $e_1 \equiv e_2 \leftrightarrow n(e_1) = n(e_2)$.
+% INSERT PROOF THAT $e_1 \equiv e_2 \leftrightarrow n(e_1) = n(e_2)$.
+% Let $g(e)$ be the query graph for an expression $e$. 
+% If $e$ is composed of aggregations and multiplications ($\sum$ and $*$), 
+% then $e_1 \equiv e_2 \leftrightarrow g(e_1) \equiv g(e_2)$, due to Cohen.
+% Dylan's todo: study the proof and extend it.
+% We want to extend it to include expressions that have $\sum$, $*$, and $+$.
+
+% The problem of deciding whether $g(e_1) \equiv g(e_2)$ is the graph isomorphism problem,
+% which is in NP but has not been proved to be in PTIME or NP-hard.
+% There is a graph coloring method to determine whether $g(e_1) \equiv g(e_2)$.
+% This method is fast for \textit{almost all} graphs, but on some graphs it is exponential.
+% Dylan's todo: study the details from Grohe.
+
+% \paragraph{Enumeration strategy}
+% Todo: detail our two major decisions: whether to factor out a CSE from +, and changing the order of aggregations.
+
+% \paragraph{Extracting an MILP}
+% Todo...
+
+% \paragraph{Results and Contributions, Future Work}
+% Todo...
